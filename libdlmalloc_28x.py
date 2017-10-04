@@ -431,7 +431,8 @@ class dl_helper:
                 cbinfo["mem"] = p.mem[p.hdr_size:]
 
             extra = self.dlchunk_callback(cbinfo)
-            info.append(" " + extra)
+            if extra:
+                info.append(" " + extra)
 
         return ''.join(info)
 
