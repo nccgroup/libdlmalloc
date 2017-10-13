@@ -31,7 +31,7 @@ except ImportError:
 
 from os.path import basename
 
-import re
+import re, binascii
 import sys, os, json
 import struct
 from functools import wraps
@@ -39,6 +39,11 @@ from functools import wraps
 ################################################################################
 # HELPERS
 ################################################################################
+
+
+# XXX - move to helper.py
+def is_ascii(s):
+    return all(c < 128 and c > 1 for c in s)
 
 # XXX - move to _gdb.py
 # Taken from gef. Let's us see proper backtraces from python exceptions
@@ -355,7 +360,7 @@ class dl_helper:
     # XXX - move to _gdb.py
     def hexdump(self, p, maxlen=0, off=0):
         data = self.ptr_from_chunk(p) + off
-        size = self.chunksize(p) - p.hdr_size - off
+        size = p.real_size - p.hdr_size - off
         if size < 0:
             self.logmsg("[!] Chunk corrupt? Bad size")
             return
@@ -880,12 +885,12 @@ class dl_chunk(dl_structure):
             self.head) = struct.unpack_from("<QQ", mem, 0x0)
 
         if size == None:
-            real_size = (self.head & ~self.dl.INUSE_BITS)
+            self.real_size = (self.head & ~self.dl.INUSE_BITS)
             self.cinuse_bit = ((self.head & self.dl.CINUSE_BIT) >> 1)
             self.pinuse_bit = self.head & self.dl.PINUSE_BIT
         else:
-            # a size was provided (for a malformed chunk with an invalid size)
-            real_size = size & ~self.dl.INUSE_BITS
+            self.dl.logmsg("Warning: a size was provided (for a malformed chunk with an invalid size)")
+            self.real_size = size & ~self.dl.INUSE_BITS
             self.cinuse_bit = ((size & self.dl.CINUSE_BIT) >> 1)
             self.pinuse_bit = size & self.dl.PINUSE_BIT
 
@@ -899,22 +904,6 @@ class dl_chunk(dl_structure):
             # Trust the caller is right
             self.inuse = inuse
             self.hdr_size = self.dl.INUSE_HDR_SZ
-
-        if self.inuse:
-#            if read_data:
-#                if self.address != None:
-#                    # a string of raw memory was not provided
-#                    try:
-#                        mem = self.inferior.read_memory(self.address, real_size + self.dl.SIZE_SZ)
-#                    except TypeError:
-#                        self.dl.logmsg("Invalid address specified.")
-#                        return None
-#                    except RuntimeError:
-#                        self.dl.logmsg("Could not read address {0:#x}".format(self.address))
-#                        return None
-#
-                real_size = (real_size - self.dl.SIZE_SZ) / self.dl.SIZE_SZ
-#                self.data = struct.unpack_from("<%dI" % real_size, mem, self.dl.INUSE_HDR_SZ)
 
         if not self.inuse:
             # We sometimes provide an address to use for reference, even when
@@ -935,7 +924,7 @@ class dl_chunk(dl_structure):
                 (self.fd, \
                 self.bk  ) = struct.unpack_from("<QQ", mem, self.dl.INUSE_HDR_SZ)
             # Is it a tree chunk?
-            if real_size > self.dl.MAX_SMALL_SIZE:
+            if self.real_size > self.dl.MAX_SMALL_SIZE:
                 self.istree = True
                 self.hdr_size = self.dl.TREE_HDR_SZ
                 if self.dl.SIZE_SZ == 4:
@@ -1545,8 +1534,10 @@ if is_gdb:
             self.dl.logmsg(' -c      number of chunks to print')
             # I suspect we want this to be a different command?
             self.dl.logmsg(' -s      search pattern when print chunks')
+            self.dl.logmsg(' -S      size to override chunk size (e.g. if corrupted)')
             self.dl.logmsg(' --depth depth to search inside chunk')
             self.dl.logmsg(' -d      debug and force printing stuff')
+            self.dl.logmsg(' -p      print data inside at given offset (summary representation)')
             self.dl.logmsg("Flag legend: C=CINUSE, P=PINUSE")
             return
 
@@ -1566,11 +1557,16 @@ if is_gdb:
                 s_found = False
                 c_found = False
                 m_found = False
+                S_found = False
+                p_found = False
                 depth_found = False
                 debug = False
-                count = 1
+                count_ = 1
                 search_val = None
                 search_depth = 0
+                print_offset = None
+                addresses = []
+                size = None
                 for item in arg.split():
                     if m_found:
                         if item.find("0x") != -1:
@@ -1589,8 +1585,20 @@ if is_gdb:
                             search_val = item
                         s_found = False
                     elif c_found:
-                        count = int(item)
+                        count_ = int(item)
                         c_found = False
+                    elif p_found:
+                        try:
+                            print_offset = int(item)
+                        except ValueError:
+                            print_offset = int(item, 16)
+                        p_found = False
+                    elif S_found:
+                        if item.find("0x") != -1:
+                            size = int(item, 16)
+                        else:
+                            size = int(item)
+                        S_found = False
                     elif item.find("-v") != -1:
                         verbose += 1
                     elif item.find("-f") != -1:
@@ -1599,8 +1607,12 @@ if is_gdb:
                         hexdump = True
                     elif item.find("-m") != -1:
                         m_found = True
+                    elif item.find("-p") != -1:
+                        p_found = True
                     elif item.find("-s") != -1:
                         s_found = True
+                    elif item.find("-S") != -1:
+                        S_found = True
                     elif item.find("--depth") != -1:
                         depth_found = True 
                     elif item.find("-c") != -1:
@@ -1614,53 +1626,73 @@ if is_gdb:
                                 p = int(item, 16)
                             except ValueError:
                                 p = self.parse_var(item)
+                        addresses.append(p)
                     elif item.find("$") != -1:
                         p = self.parse_var(item)
+                        addresses.append(p)
                     elif item.find("-d") != -1:
                         debug = True # This is an undocumented dev option
                     elif item.find("-h") != -1:
                         self.help()
                         return
 
-                if p == None:
+                if not addresses or None in addresses:
                     print("WARNING: No address supplied?")
                     self.help()
                     return
 
-                p = dl_chunk(self.dl, p)
-                dump_offset = 0
-                while True:
-                    suffix = ""
-                    if search_val != None:
-                        # Don't print if the chunk doesn't have the pattern
-                        if not self.dl.search_chunk(p, search_val, 
-                                depth=search_depth):
-                            suffix = " [NO MATCH]"
-                        else:
-                            suffix = " [MATCH]"
-
-                    if verbose == 0:
-                        print(self.dl.chunk_info(p) + suffix)
-                    elif verbose == 1:
-                        print(p)
-                        dump_offset = self.dl.dispatch_callback(p, debug=debug)
-                    if hexdump:
-                        self.dl.hexdump(p, maxbytes, dump_offset)
-                    count -= 1
-                    if count != 0:
-                        if verbose or hexdump:
-                            print('--')
-                        if self.dl.is_end_chunk(p) and force == False:
-                            print("<<< end of heap segment >>>")
-                            break
-                        if self.dl.chunksize(p) == 0:
-                            print("[!] Detected chunksz 0")
-                            break
-                        p = dl_chunk(self.dl, addr=(p.address + self.dl.chunksize(p)))
-                        if p.initOK == False:
-                            break
+                bFirst = True
+                for addr in addresses:
+                    if bFirst:
+                        bFirst = False
                     else:
-                        break
+                        print("-"*60)
+                    count = count_
+                    p = dl_chunk(self.dl, addr, size=size)
+                    dump_offset = 0
+                    while True:
+                        suffix = ""
+                        if search_val != None:
+                            # Don't print if the chunk doesn't have the pattern
+                            if not self.dl.search_chunk(p, search_val, 
+                                    depth=search_depth):
+                                suffix = " [NO MATCH]"
+                            else:
+                                suffix = " [MATCH]"
+                        # XXX - the current representation is not really generic as we print the first short
+                        # as an ID and the second 2 bytes as 2 characters. We may want to support passing the
+                        # format string as an argument but this is already useful
+                        if print_offset != None:
+                            mem = get_inferior().read_memory(p.data_address + print_offset, 4)
+                            (id_, desc) = struct.unpack_from("<H2s", mem, 0x0)
+                            if is_ascii(desc):
+                                suffix += " 0x%04x %s" % (id_, str(desc, encoding="utf-8"))
+                            else:
+                                suffix += " 0x%04x hex(%s)" % (id_, str(binascii.hexlify(desc), encoding="utf-8"))
+
+
+                        if verbose == 0:
+                            print(self.dl.chunk_info(p) + suffix)
+                        elif verbose == 1:
+                            print(p)
+                            dump_offset = self.dl.dispatch_callback(p, debug=debug)
+                        if hexdump:
+                            self.dl.hexdump(p, maxbytes, dump_offset)
+                        count -= 1
+                        if count != 0:
+                            if verbose or hexdump:
+                                print('--')
+                            if self.dl.is_end_chunk(p) and force == False:
+                                print("<<< end of heap segment >>>")
+                                break
+                            if self.dl.chunksize(p) == 0:
+                                print("[!] Detected chunksz 0")
+                                break
+                            p = dl_chunk(self.dl, addr=(p.address + self.dl.chunksize(p)))
+                            if p.initOK == False:
+                                break
+                        else:
+                            break
             except Exception as e:
                 show_last_exception()
 
