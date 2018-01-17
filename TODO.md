@@ -10,3 +10,5 @@
   using -v.
 * Support setting the dl_helper 'foot' option to dictate if we bother with the
   footer-related stuff
+* have a dlbinwalk command similar to mpbinwalk (libmempool) to list chunks for a
+  given bin size
