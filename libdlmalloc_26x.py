@@ -34,6 +34,7 @@ try:
     is_gdb = True
 except ImportError:
     is_gdb = False
+    print("[libdlmalloc_26x] Not running inside of GDB, limited functionality")
 
 from os.path import basename
 
