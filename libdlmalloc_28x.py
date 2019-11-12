@@ -1,4 +1,4 @@
-# libdlmalloc_28x.py
+#!/usr/bin/python3
 #
 # This file is part of libdlmalloc.
 # Copyright (c) 2017, Aaron Adams <aaron.adams(at)nccgroup(dot)trust>
@@ -22,6 +22,7 @@ from __future__ import print_function
 
 import traceback
 import importlib
+from array import array
 
 try:
     import gdb
@@ -1539,6 +1540,7 @@ if is_gdb:
             self.dl.logmsg(' --depth depth to search inside chunk')
             self.dl.logmsg(' -d      debug and force printing stuff')
             self.dl.logmsg(' -p      print data inside at given offset (summary representation)')
+            self.dl.logmsg(' -n      do not output the trailing newline (summary representation)')
             self.dl.logmsg("Flag legend: C=CINUSE, P=PINUSE")
             return
 
@@ -1553,6 +1555,7 @@ if is_gdb:
                 verbose = 0
                 force = False
                 hexdump = False
+                no_newline = False
                 maxbytes = 0
 
                 s_found = False
@@ -1604,6 +1607,8 @@ if is_gdb:
                         verbose += 1
                     elif item.find("-f") != -1:
                         force = True
+                    elif item.find("-n") != -1:
+                        no_newline = True
                     elif item.find("-x") != -1:
                         hexdump = True
                     elif item.find("-m") != -1:
@@ -1660,20 +1665,48 @@ if is_gdb:
                                 suffix = " [NO MATCH]"
                             else:
                                 suffix = " [MATCH]"
+                        # XXX - this is hardcoded for x64 dlmalloc as we have been testing it on asa912-smp for now
+                        #print_offset = 0x54
+                        i_spi_offset = 0x30
                         # XXX - the current representation is not really generic as we print the first short
                         # as an ID and the second 2 bytes as 2 characters. We may want to support passing the
                         # format string as an argument but this is already useful
+                        #if print_offset != None:
+                        #    mem = get_inferior().read_memory(p.data_address + print_offset, 4)
+                        #    (id_, desc) = struct.unpack_from("<H2s", mem, 0x0)
+                        #    if is_ascii(desc):
+                        #        suffix += " 0x%04x %s" % (id_, str(desc, encoding="utf-8"))
+                        #    else:
+                        #        suffix += " 0x%04x hex(%s)" % (id_, str(binascii.hexlify(desc), encoding="utf-8"))
                         if print_offset != None:
-                            mem = get_inferior().read_memory(p.data_address + print_offset, 4)
-                            (id_, desc) = struct.unpack_from("<H2s", mem, 0x0)
+                            mem = get_inferior().read_memory(p.data_address, print_offset+0x10)
+                            mem_off = mem[print_offset: print_offset + 6]
+                            (id_, desc) = struct.unpack_from("<H4s", mem_off, 0x0)
+                            not_match = False
                             if is_ascii(desc):
-                                suffix += " 0x%04x %s" % (id_, str(desc, encoding="utf-8"))
-                            else:
-                                suffix += " 0x%04x hex(%s)" % (id_, str(binascii.hexlify(desc), encoding="utf-8"))
+                                c = desc[0]
+                                for c2 in desc:
+                                    if c2 != c:
+                                        not_match = True
+                                        break
+                                if not not_match:
+                                    mem_spi = mem[i_spi_offset: i_spi_offset + 8]
+                                    i_spi = struct.unpack_from("8s", mem_spi, 0x0)[0]
+                                    try:
+                                        i_spi = str(i_spi, encoding="utf-8")
+                                    except UnicodeDecodeError:
+                                        i_spi = "UNKNOWNX"
+                                    suffix += " %s %s %d" % (i_spi, str(desc, encoding="utf-8"), id_)
+                            # if not ascii, probably not interesting anyway?
+                            #else:
+                            #    suffix += " 0x%04x hex(%s)" % (id_, str(binascii.hexlify(desc), encoding="utf-8"))
 
 
                         if verbose == 0:
-                            print(self.dl.chunk_info(p) + suffix)
+                            if no_newline:
+                                print(self.dl.chunk_info(p) + suffix, end="")
+                            else:
+                                print(self.dl.chunk_info(p) + suffix)
                         elif verbose == 1:
                             print(p)
                             dump_offset = self.dl.dispatch_callback(p, debug=debug)
